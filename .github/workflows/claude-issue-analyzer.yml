@@ -1,0 +1,170 @@
+name: Claude Issue Analyzer
+
+on:
+  issues:
+    types: [opened, edited]
+
+# If an issue is edited while a previous analysis is still running,
+# cancel the older run and start fresh with the latest content.
+concurrency:
+  group: issue-analyzer-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-issue:
+    # Skip runs triggered by bots to prevent feedback loops
+    # (e.g. if another automation edits the issue after Claude comments).
+    if: github.event.sender.type != 'Bot'
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read   # checkout
+      issues: write    # label assignment + comment posting
+      id-token: write  # OIDC token for Claude OAuth
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Ensure all 7 game-specific labels exist before Claude tries to use them.
+      # --force makes this idempotent: updates color/description if the label
+      # already exists, creates it if it does not.
+      - name: Create or update game labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          gh label create "bug"           --description "Something is broken or not working as expected"  --color "d73a4a" --repo "$REPO" --force
+          gh label create "enhancement"   --description "New feature or improvement request"              --color "a2eeef" --repo "$REPO" --force
+          gh label create "question"      --description "General question about the game or code"         --color "d876e3" --repo "$REPO" --force
+          gh label create "documentation" --description "Documentation needs improvement or is missing"   --color "0075ca" --repo "$REPO" --force
+          gh label create "performance"   --description "FPS, rendering speed, memory usage, or gameplay lag" --color "e4e669" --repo "$REPO" --force
+          gh label create "ui/ux"         --description "Visual design, layout, canvas sizing, or UX problems" --color "f9d0c4" --repo "$REPO" --force
+          gh label create "gameplay"      --description "Game mechanics, scoring, levels, or rules"       --color "c2e0c6" --repo "$REPO" --force
+
+      # Claude reads the issue via gh CLI (safe: no body injection into YAML),
+      # assigns appropriate labels, and posts one structured diagnostic comment.
+      # ISSUE_NUMBER and REPO are passed as env vars — only safe scalar values
+      # (integer + owner/repo string) are injected into the YAML. The issue
+      # title and body are fetched by Claude at runtime via gh issue view.
+      - name: Analyze issue with Claude
+        uses: anthropics/claude-code-action@v1
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Restrict Claude to only the gh issue subcommands it needs.
+          claude_args: >-
+            --allowed-tools
+            "Bash(gh issue view *)"
+            "Bash(gh issue edit *)"
+            "Bash(gh issue comment *)"
+          prompt: |
+            You are an automated issue analyst for a vanilla JavaScript Tetris game repository.
+            Your job is to read a GitHub issue, assign the correct label(s), and post a single
+            structured diagnostic comment that guides future contributors.
+
+            ## Repository context
+
+            The game is implemented in three files:
+
+            **game.js** (~305 lines) — all game logic. Key functions you must reference
+            when relevant:
+            - `collide(shape, ox, oy)` — collision detection against board edges and placed pieces
+            - `rotateCW(shape)` — produces a clockwise-rotated copy of a piece matrix
+            - `tryRotate()` — attempts rotation with up to ±2 column wall-kick offsets
+            - `lockPiece()` — calls merge(), clearLines(), then spawn()
+            - `clearLines()` — scans for full rows, removes them, updates score/level/dropInterval
+            - `ghostY()` — calculates the hard-drop landing row for ghost-piece rendering
+            - `draw()` — full canvas repaint: grid, board, ghost, active piece, next preview
+            - `loop(ts)` — rAF game loop; handles gravity timing via dropAccum/dropInterval
+            - `init()` — resets all state and starts a new game
+
+            **index.html** — two `<canvas>` elements (main board 300×600 px + next-piece preview
+            120×120 px), HUD elements (#score, #lines, #level), #overlay for pause/game-over.
+
+            **style.css** — dark/retro theme using CSS custom properties and flexbox.
+
+            ## Available labels
+
+            Apply one or more that accurately describe the issue:
+
+            - `bug`           — Something is broken or does not behave as expected
+            - `enhancement`   — New feature or improvement request
+            - `question`      — General question about the game or code
+            - `documentation` — Documentation needs improvement or is missing
+            - `performance`   — FPS, rendering speed, memory usage, or gameplay lag
+            - `ui/ux`         — Visual design, layout, canvas sizing, or UX problems
+            - `gameplay`      — Game mechanics, scoring algorithm, level progression, or rules
+
+            ## Your task — follow these steps in order
+
+            ### Step 1: Read the issue
+
+            Run this command to fetch the issue title and body safely:
+
+            ```
+            gh issue view $ISSUE_NUMBER --repo $REPO --json number,title,body,labels
+            ```
+
+            Read the output carefully before taking any other action.
+
+            ### Step 2: Assign labels
+
+            Based on the issue content, assign one or more labels with:
+
+            ```
+            gh issue edit $ISSUE_NUMBER --repo $REPO --add-label "LABEL_NAME"
+            ```
+
+            Call this once per label you want to add. Do NOT remove existing labels.
+            Choose the most specific label(s) that fit the issue.
+            When the issue is clearly a bug report, use `bug` — not `enhancement`.
+            If the body is empty or too vague to classify, apply `question`.
+
+            ### Step 3: Post one diagnostic comment
+
+            Post exactly one comment using:
+
+            ```
+            gh issue comment $ISSUE_NUMBER --repo $REPO --body "BODY"
+            ```
+
+            The comment body MUST follow this exact Markdown structure:
+
+            ## Issue Diagnostic
+
+            **Summary:** <one-sentence description of the problem or request>
+
+            **Labels applied:** <comma-separated list of labels you assigned in Step 2>
+
+            **Affected components:**
+            <List the specific files and game.js functions most relevant to this issue.
+            Examples: "game.js → clearLines(), lockPiece()" or "style.css → canvas sizing"
+            or "index.html → #overlay element". If no specific function is identifiable,
+            name the file and the area, e.g. "game.js → scoring logic".>
+
+            **Complexity estimate:** <Small | Medium | Large>
+            - Small: isolated change to one function, no ripple effects on game state
+            - Medium: touches 2–4 functions or requires understanding loop/timing
+            - Large: cross-cutting concern, changes to multiple systems or canvas layout
+
+            **High-level approach:**
+            <2–4 sentences describing how a developer should implement the fix or feature.
+            Reference specific function names from game.js. This text will be used to
+            guide automated code generation, so be precise about what needs to change.>
+
+            ## Rules
+
+            - Always run Step 1 before doing anything else.
+            - Apply every label that accurately fits; apply at least one label.
+            - If the issue body is empty or too vague, apply `question` and note in the
+              diagnostic that more detail is needed.
+            - Post exactly one comment. Do not post multiple comments.
+            - Do not modify the issue title or body.
+            - Do not close or reopen the issue.
+            - Do not perform any action outside of the three steps above.
